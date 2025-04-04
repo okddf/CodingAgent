@@ -1,11 +1,11 @@
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from tools import clone_repo
-from tools import process_repo
+from tools import process_repo2
 from langchain import hub
 from llm import llm
 
 
-tools = [clone_repo, process_repo]
+tools = [clone_repo, process_repo2]
 
 agent_prompt = hub.pull("hwchase17/openai-tools-agent")
 agent = create_tool_calling_agent(llm, tools, agent_prompt)

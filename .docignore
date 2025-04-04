@@ -16,5 +16,7 @@
 *.jpg
 *.svg
 *.zip
+*.h
+*.hpp
 .env
 .env.*
