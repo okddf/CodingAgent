@@ -1,0 +1,67 @@
+Hallgató neve: Kónya Gergely      
+Neptun kódja: OHUNLA  
+Email címe: konya.gergely.13@gmail.com      
+Konzulens(ek) neve: Ficzere Dániel, Karz Gergely
+Önlab tantárgy kódja: BMEVITMAL04
+Tanév/félév: 2024/2025. 2. félév
+
+Feladat/téma címe: Automatikus AI Kódíró Asszisztens
+
+Tervezett munkafázisok a félév során:
+1-3. oktatási hét:
+  - Szakirodalom feldolgozása a következő témakörökben:
+    * Ágensek felépítése és működése
+    * LangChain framework és komponenseinek megismerése
+    * SWE-bench szoftverfejlesztési feladatokból álló projekt megismerése
+    * Kódbázisból készíthető diagramok megismerése
+    * LLM-ek működésének megismerése
+    * Markitdown projekt megismerése markitdown fájlok készítéséhez
+
+4-5. oktatási hét:
+  - Rendszerterv elkészítése:
+    * Architektúra tervezés
+    * A program részeinek meghatározása
+      - Ágens LLM-et használó rétege
+      - Github repositoryból a kódbázis kinyeréséért felelős réteg
+      - A Kódbázisból diagramok készítéséért felelős réteg
+      - A Kódbázisból javaslatokat készítő réteg
+      - Github repositoryhoz pull request-et készítő réteg
+
+5-8. oktatási hét:
+  - Funkcionalitás implementálása:
+    * Ágens LLM-et használó rétegének implementálása
+      - Langchain framework használatával pythonban
+      - OpenAI LLM használatával API segítségével
+    * Github repositoryból a kódbázis kinyeréséért felelős rétegének implementálása
+      - Gitpython könyvtár használatával pythonban github repositoryból kódbázis kinyerése
+    * A Kódbázisból diagramok készítéséért felelős rétegének implementálása
+      - Graphviz könyvtár használatával pythonban kódbázisból UML diagramok készítése
+    * A Kódbázisból javaslatokat készítő rétegének implementálása
+      - Langchain framework használatával pythonban
+      - OpenAI LLM használatával API segítségével
+      - Változások új ágon való commitolása és pusholása gitpython könyvtárral
+    * Github repositoryhoz pull request-et készítő rétegének implementálása
+      - Github könyvtár használatával pythonban
+
+9-10. oktatási hét:
+  - Tesztelés:
+    * SWE-bench használatával valós github issue-k megoldásának tesztelése
+    * A tesztelés eredményeinek dokumentálása 
+
+11. oktatási hét:
+  - Dokumentáció első verziójának elkészítése:
+    * Rendszerleírás és architektúra dokumentálása
+    * Felhasználói útmutató
+    * Használt könyvtárak dokumentálása
+    * Tesztelési dokumentáció
+    * Konzulensi értékelésre beadás
+
+12-13. oktatási hét:
+  - Dokumentáció véglegesítése a visszajelzések alapján
+  - Prezentáció elkészítése
+  - Esetleges hibajavítások és finomhangolások
+
+14. oktatási hét:
+  - Prezentáció gyakorlása tankörtársakkal
+  - Visszajelzések alapján a prezentáció finomítása
+  - Végleges beszámoló megtartása a tárgyfelelősnek
