@@ -20,4 +20,5 @@
 *.hpp
 .env
 .env.*
+.git
 .*

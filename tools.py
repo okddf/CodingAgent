@@ -57,20 +57,24 @@ def extract_elements_with_parser(code: str, parser) -> List[Dict]:
       (block)@block
     ) @function
     """)
-    print(code)
     captures = query.captures(tree.root_node)
     if len(captures) > 0:
         for i in range(len(captures["function"])):
             for child in captures["function"][i].children:
                 if child.type == 'identifier':
                     function_name = child.text.decode('utf8') 
-                    print(function_name)
                 if child.type == 'parameters':
                     parameters = child.text.decode('utf8') 
-                    print(parameters)
                 if child.type == 'block':
                     block = child.text.decode('utf8') 
-                    print(block)
+
+            elements.append({
+                "type": "function",
+                "name": function_name,
+                "code": block
+            })
+        
+    print(elements)
 
     return elements
 
@@ -90,12 +94,10 @@ def identify_excludable_files(file_paths: list) -> list:
         EXCLUDE_PATTERNS = [line.strip() for line in f if line.strip()]
 
     excluded_files = []
-    
-    excluded_files = []
-    
+        
     for file_path in file_paths:
         basename = os.path.basename(file_path)
-        if basename.startswith('.') and basename not in ['.env', '.env.local']:
+        if basename.startswith('.'):
             excluded_files.append(file_path)
             continue
             
@@ -116,27 +118,39 @@ def identify_excludable_files(file_paths: list) -> list:
 def split_repo(repo_path: str) -> list:
     '''
     Splits the repository into logical parts (file by file) to summarize it.
-
-    Args:
-        repo_path: The path to the local repository directory.
+    Preserves original file formatting for accurate parsing.
     '''
-    loader = DirectoryLoader(repo_path, silent_errors=True)
-    documents = loader.load()
-    file_paths = [doc.metadata['source'] for doc in documents]
-
+    file_paths = []
+    for root, dirs, files in os.walk(repo_path):
+        if '.git' in dirs:
+            dirs.remove('.git')
+        for file in files:
+            file_paths.append(os.path.join(root, file))
+    
     file_paths = [os.path.relpath(path, repo_path) for path in file_paths]
     excludable_files = identify_excludable_files.invoke({"file_paths": file_paths})
 
-    filtered_documents = [
-        doc for doc in documents 
-        if os.path.relpath(doc.metadata['source'], repo_path) not in excludable_files 
-        and not os.path.basename(doc.metadata['source']).startswith('.')
-    ]
-
-    return [{
-        "file_path": os.path.relpath(doc.metadata['source'], repo_path), 
-        "content": doc.page_content
-    } for doc in filtered_documents]
+    filtered_files = []
+    for file_path in file_paths:
+        abs_path = os.path.join(repo_path, file_path)
+        basename = os.path.basename(file_path)
+        
+        if file_path in excludable_files:
+            continue
+        if basename.startswith('.'):
+            continue
+            
+        try:
+            with open(abs_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            filtered_files.append({
+                "file_path": file_path,
+                "content": content
+            })
+        except (UnicodeDecodeError, IOError) as e:
+            print(f"Skipping {file_path} due to error: {e}")
+    
+    return filtered_files
 
 def extract_elements_with_llm(code: str, file_extension: str) -> List[Dict]:
     """
