@@ -1,4 +1,1 @@
-summarize a GitHub repo with a link for it: https://github.com/ZinkRuben/mylittlechristmastree
-summarize a GitHub repo with a link for it: https://github.com/okddf/QuantTrader
-summarize a GitHub repo with a link for it: https://github.com/ZinkRuben/runningnotificationnotshit
-summarize a GitHub repo with a link for it: https://github.com/okddf/CodingAgent
+summarize this repo: C:\Users\konya\Desktop\CodingAgent

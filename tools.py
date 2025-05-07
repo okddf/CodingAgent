@@ -1,19 +1,22 @@
 from langchain.tools import tool
-from langchain_community.document_loaders import GitLoader
-import git
+from langchain_community.document_loaders import DirectoryLoader
 import os
+import ast
 from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
 from llm import llm
-import tiktoken
 import fnmatch
 from typing import List, Dict
+from langchain_core.output_parsers.json import JsonOutputParser
+from langchain.prompts import PromptTemplate
+from langchain.schema.runnable import Runnable
 import json
+from tree_sitter import Language, Parser
+import tree_sitter_python as tspython
 
-tokenizer = tiktoken.get_encoding("cl100k_base")
+PYTHON_LANGUAGE = Language(tspython.language())
 
 CLASS_TEMPLATE = """## `{class_name}`
-**Description**: {description}
+{description}
 
 **Attributes**:
 | Name | Type | Description |
@@ -21,15 +24,10 @@ CLASS_TEMPLATE = """## `{class_name}`
 {attributes_table}
 
 **Methods**:
-{methods_list}
+{methods_list}"""
 
-**Example Usage**:
-```{language}
-{example_usage}
-```"""
-
-FUNCTION_TEMPLATE = """### `{function_name}({params}) -> {return_type}`
-**Description**: {description}
+FUNCTION_TEMPLATE = """## `{function_name}({params}) -> {return_type}`
+{description}
 
 **Parameters**:
 | Name | Type | Default | Description |
@@ -39,25 +37,42 @@ FUNCTION_TEMPLATE = """### `{function_name}({params}) -> {return_type}`
 **Returns**:
 | Type | Description |
 |------|-------------|
-{returns_table}
+{returns_table}"""
 
-**Example Usage**:
-```{language}
-{example_usage}
-```"""
+def initialize_parser():
+    parser = Parser(PYTHON_LANGUAGE)
+    return parser
 
-@tool()
-def clone_repo(repo_url: str, clone_dir: str = "./cloned_repo") -> str:
-    '''
-    Clones a GitHub repository to a specified directory.
+def extract_elements_with_parser(code: str, parser) -> List[Dict]:
+    """
+    Extract classes and functions using tree-sitter.
+    """
+    elements = []
+    tree = parser.parse(bytes(code, "utf8"))
 
-    Args:
-        repo_url: The URL of the GitHub repository.
-        clone_dir: The directory to clone the repository into.
-    '''
-    if not os.path.exists(clone_dir):
-        git.Repo.clone_from(repo_url, clone_dir)
+    query = PYTHON_LANGUAGE.query("""
+    (function_definition
+      (identifier)@name
+        (parameters)@parameters
+      (block)@block
+    ) @function
+    """)
+    print(code)
+    captures = query.captures(tree.root_node)
+    if len(captures) > 0:
+        for i in range(len(captures["function"])):
+            for child in captures["function"][i].children:
+                if child.type == 'identifier':
+                    function_name = child.text.decode('utf8') 
+                    print(function_name)
+                if child.type == 'parameters':
+                    parameters = child.text.decode('utf8') 
+                    print(parameters)
+                if child.type == 'block':
+                    block = child.text.decode('utf8') 
+                    print(block)
 
+    return elements
 
 @tool()
 def identify_excludable_files(file_paths: list) -> list:
@@ -69,10 +84,13 @@ def identify_excludable_files(file_paths: list) -> list:
     '''
 
     docignore_path = '.docignore'
-    
-    with open(docignore_path, 'r') as f:
-        EXCLUDE_PATTERNS = [line.strip() for line in f ]
+    EXCLUDE_PATTERNS = []
 
+    with open(docignore_path, 'r') as f:
+        EXCLUDE_PATTERNS = [line.strip() for line in f if line.strip()]
+
+    excluded_files = []
+    
     excluded_files = []
     
     for file_path in file_paths:
@@ -94,121 +112,97 @@ def identify_excludable_files(file_paths: list) -> list:
     print(excluded_files)
     return excluded_files
 
-
 @tool()
-def split_repo(clone_dir: str) -> list:
+def split_repo(repo_path: str) -> list:
     '''
     Splits the repository into logical parts (file by file) to summarize it.
 
     Args:
-        clone_dir: The directory where the repository is cloned.
+        repo_path: The path to the local repository directory.
     '''
-    loader = GitLoader(repo_path=clone_dir, branch="master")
+    loader = DirectoryLoader(repo_path, silent_errors=True)
     documents = loader.load()
-    file_paths = [doc.metadata['file_path'] for doc in documents]
+    file_paths = [doc.metadata['source'] for doc in documents]
 
+    file_paths = [os.path.relpath(path, repo_path) for path in file_paths]
     excludable_files = identify_excludable_files.invoke({"file_paths": file_paths})
 
-    filtered_documents = [doc for doc in documents if doc.metadata['file_path'] not in excludable_files and not doc.metadata['file_path'].startswith('.')]
+    filtered_documents = [
+        doc for doc in documents 
+        if os.path.relpath(doc.metadata['source'], repo_path) not in excludable_files 
+        and not os.path.basename(doc.metadata['source']).startswith('.')
+    ]
 
-    return [{"file_path": doc.metadata['file_path'], "content": doc.page_content} for doc in filtered_documents]
-
+    return [{
+        "file_path": os.path.relpath(doc.metadata['source'], repo_path), 
+        "content": doc.page_content
+    } for doc in filtered_documents]
 
 def extract_elements_with_llm(code: str, file_extension: str) -> List[Dict]:
     """
-    Uses LLM to identify all code elements with their types and boundaries.
-    Returns: [
-        {"type": "class", "name": "ClassName", "code": "class ClassName..."},
-        {"type": "function", "name": "function_name", "code": "def func..."}
-    ]
+    Extract code elements using text-based format
     """
-    prompt = f"""Analyze this {file_extension} code and identify ONLY classes and functions. Return STRICTLY as JSON with NO other text or explanations.
-    
-    Required format:
-    {{
-        "elements": [
-            {{
-                "type": "class|function",
-                "name": "ElementName",
-                "code": "FullElementCode"
-            }}
-        ]
-    }}
+    prompt = f"""You are documenting a {file_extension} codebase. Extract ONLY class/function definitions THAT ARE DEFINED IN THIS FILE.
+    If there is no such definition simply return a message saying you didn't find any.
 
-    Rules:
-    1. Only include classes and functions
-    2. Skip all imports, comments, and other code
-    3. Return raw JSON without markdown formatting
-    4. Include complete code blocks
+    IGNORE:
+    - Imported classes/functions (e.g., `from x import Y`)
+    - Instantiations (`x = ClassName()`)
+    - Function calls (`function_name()`)
+    - Decorators (unless part of the definition)
+    - Comments/docstrings (keep them only if they're inside the definition)
 
-    Code to analyze:
+    OUTPUT FORMAT:
+    === ELEMENT ===
+    Type: class or function depending on the element type
+    Name: the name of the defined element
+    Code: full code of the element
+    === END ELEMENT ===
+
+    CODE TO ANALYZE:
     {code}"""
     
-    llm_response = llm.invoke(prompt)
-    json_str = llm_response.content.strip()
-    if json_str.startswith('```json'):
-        json_str = json_str[7:-3].strip()
-    elif json_str.startswith('```'):
-        json_str = json_str[3:-3].strip()
-        
-    data = json.loads(json_str)
-    return data["elements"]
-    
+    response = llm.invoke(prompt).content
+    return parse_elements_from_text(response)
 
-def process_file(file_path: str, code: str) -> Dict:
-    """
-    Handles both LLM analysis and structured documentation generation.
-    Returns: {
-        "file_path": "path/to/file.py",
-        "summary": "File purpose...",
-        "elements": [
-            {
-                "type": "class",
-                "name": "A",
-                "docs": "Class docs...",
-                "code": "class A: ..."
-            }
-        ]
-    }
-    """
-    print(f"Analyzing {file_path}")
-    file_extension = os.path.splitext(file_path)[1]
-    elements = extract_elements_with_llm(code, file_extension)
-
-    file_summary = llm.invoke(
-        f"Summarize this file's overall purpose in 1-2 sentences:\n{code}"
-    )
+def parse_elements_from_text(text: str) -> List[Dict]:
+    """Parse the text response into structured elements"""
+    elements = []
+    current_element = {}
     
-    processed_elements = []
-    for element in elements:
-        docs = generate_structured_docs(element["type"], element["code"], file_extension)
-        processed_elements.append({
-            **element,
-            "docs": docs
-        })
+    for line in text.split('\n'):
+        line = line.strip()
+        if line.startswith("=== ELEMENT ==="):
+            current_element = {}
+        elif line.startswith("Type:"):
+            current_element["type"] = line.split(":", 1)[1].strip()
+        elif line.startswith("Name:"):
+            current_element["name"] = line.split(":", 1)[1].strip()
+        elif line.startswith("Code:"):
+            current_element["code"] = ""
+        elif line.startswith("=== END ELEMENT ==="):
+            if current_element:
+                current_element["code"] = current_element["code"].strip()
+                elements.append(current_element)
+        elif "code" in current_element:
+            current_element["code"] += line + "\n"
     
-    #print(processed_elements)
-    
-    return {
-        "file_path": file_path,
-        "summary": file_summary.content,
-        "elements": processed_elements
-    }
-
+    return elements
 
 def generate_structured_docs(element_type: str, code: str, file_extension: str) -> str:
-    """Generates rich documentation with attributes, parameters, and examples"""
-    
+    parser = JsonOutputParser()
+    prompt = None
     if element_type == "class":
-        prompt = f"""Analyze this {file_extension} class and extract:
+        prompt = PromptTemplate.from_template("""
+        You are an AI tool that extracts structured documentation from {file_extension} class code:
         1. Class name
         2. All attributes with types
         3. All methods with signatures
-        4. Example usage
 
         Class code:
         {code}
 
+        Your output MUST be valid JSON in this exact format and contain NO explanation, commentary, or extra text
         Return ONLY the JSON code and nothing else like this:
         {{
             "class_name": "ClassName",
@@ -218,40 +212,39 @@ def generate_structured_docs(element_type: str, code: str, file_extension: str) 
             ],
             "methods": [
                 {{"name": "method1", "params": ["param1: type"], "description": "..."}}
-            ],
-            "example": "usage example code"
-        }}"""
-            
+            ]
+        }}""")
     elif element_type == "function":
-        prompt = f"""Analyze this {file_extension} function and extract:
+        prompt = PromptTemplate.from_template("""
+        You are an AI tool that extracts structured documentation from {file_extension} function code::
         1. Function name
         2. All parameters with types
         3. Return type
-        4. Example usage
 
         Function code:
         {code}
 
-        Return ONLY the JSON code and nothing else like this:
+        Your output MUST be valid JSON in this exact format and contain NO explanation, commentary, or extra text
+        Return ONLY the raw JSON code and nothing else in strictly this format:
         {{
             "function_name": "function_name",
             "description": "Function purpose",
             "params": [
                 {{"name": "param1", "type": "str", "default": "None", "description": "..."}}
             ],
-            "returns": {{"type": "return_type", "description": "..."}},
-            "example": "usage example code"
-        }}"""
-    
-    response = llm.invoke(prompt)
-    json_str = response.content.strip()
-    if json_str.startswith('```json'):
-        json_str = json_str[7:-3].strip()
-    elif json_str.startswith('```'):
-        json_str = json_str[3:-3].strip()
+            "returns": {{"type": "return_type", "description": "..."}}
+        }}""")
 
-    data = json.loads(json_str)
-    
+    if prompt is not None:
+        chain: Runnable = prompt | llm | parser
+    else :
+        return ""
+    try:
+        data = chain.invoke({"code": code, "file_extension": file_extension})
+    except Exception as e:
+        print(f"Error parsing structured output: {e}")
+        return f"**Error generating docs for this {element_type}**"
+
     if element_type == "class":
         attrs_table = "\n".join(
             f"| `{attr['name']}` | `{attr.get('type', '')}` | {attr['description']} |"
@@ -268,8 +261,7 @@ def generate_structured_docs(element_type: str, code: str, file_extension: str) 
             class_name=data.get("class_name", "UnknownClass"),
             description=data.get("description", ""),
             attributes_table=attrs_table,
-            methods_list=methods_list,
-            example_usage=data.get("example", "# No example provided")
+            methods_list=methods_list
         )
         
     else:
@@ -287,235 +279,205 @@ def generate_structured_docs(element_type: str, code: str, file_extension: str) 
             params=", ".join(p.get('name', '') for p in data.get("params", [])),
             return_type=data['returns'].get('type', 'void'),
             params_table=params_table,
-            returns_table=returns_table,
-            example_usage=data.get("example", "# No example provided")
+            returns_table=returns_table
         )
 
+def process_file(file_path: str, code: str) -> Dict:
+    """
+    Create structured documentation for a file.
+    """
+    print(f"Analyzing {file_path}")
+    file_extension = os.path.splitext(file_path)[1]
+
+    if file_extension == '.py':
+        parser = initialize_parser()
+        elements = extract_elements_with_parser(code, parser)
+        #elements = extract_elements_with_llm(code, file_extension)
+    else:
+        elements = extract_elements_with_llm(code, file_extension)
+
+    PROMPT = (
+        "You are documenting a codebase. Analyze the given code and summarize its purpose and content. "
+        "The summary should be concise yet informative, explaining what the code does without technical jargon. "
+        "Write it as if it's part of natural developer documentation—avoid phrases like 'the provided code' or 'this file contains'. "
+        "Make it seem like that this is part of a big documentation and this is not an alone code snippet"
+        f"Here is the code to analyze: {code}"
+    )
+
+    file_summary = llm.invoke(PROMPT)
+    
+    processed_elements = []
+    for element in elements:
+        docs = generate_structured_docs(element["type"], element["code"], file_extension)
+        processed_elements.append({
+            **element,
+            "docs": docs
+        })
+    
+    return {
+        "file_path": file_path,
+        "summary": file_summary.content,
+        "elements": processed_elements,
+        "code": code
+    }
 
 @tool()
-def summarize_code(code: str) -> str:
-    '''
-    Summarizes the given code with self-review for accuracy and completeness.
-    
-    Args:
-        code: The code to summarize.
-    '''
-    tokens = tokenizer.encode(code)
-    token_count = len(tokens)
-    print(f"Token count: {token_count}")
-
-    draft_prompt = PromptTemplate(
-        input_variables=["code"],
-        template="""You are creating a documentation for a codebase with your team. Your task is to look at this file
-                    and analyze the code and create a comprehensive draft summary for your team including:
-    1. Primary purpose
-    2. Key functions/classes
-    3. Important algorithms
-    4. Input/output flow
-    5. Error handling
-
-    Code:
-    {code}
-
-    Draft Summary:"""
-    )
-    draft_chain = LLMChain(llm=llm, prompt=draft_prompt)
-    draft_summary = draft_chain.run(code)
-
-    review_prompt = PromptTemplate(
-        input_variables=["code", "draft_summary"],
-        template="""You are creating a documentation for a codebase with your team. Your task is to look at this review that 
-                    your team made about the code and make improvements and check your teams ideas so that the documentatopn
-                    is more accurate and complete:
-1. Verify technical correctness
-2. Check for missing components
-3. Ensure clarity of explanations
-4. Flag any ambiguous statements
-
-Provide specific improvements to the summary.
-
-Original Code:
-{code}
-
-Draft Summary:
-{draft_summary}
-
-Critical Review:"""
-    )
-    review_chain = LLMChain(llm=llm, prompt=review_prompt)
-    review = review_chain.run({"code": code, "draft_summary": draft_summary})
-
-    final_prompt = PromptTemplate(
-        input_variables=["code", "draft_summary", "review"],
-        template="""You are creating a documentation for a codebase with your team. Your task is to look at this file in the codebase
-                    and make a documentation based on your teams draft summary and review feedback. Create a polished, professional code summary:
-1. Incorporate review feedback
-2. Maintain technical accuracy
-3. Improve clarity and organization
-4. Keep concise but comprehensive
-
-Code:
-{code}
-
-Draft Summary:
-{draft_summary}
-
-Review Feedback:
-{review}
-
-Final Summary:"""
-    )
-    final_chain = LLMChain(llm=llm, prompt=final_prompt)
-    return final_chain.run({"code": code, "draft_summary": draft_summary, "review": review})
-
-
-@tool()
-def generate_mermaid_diagram(code: str) -> str:
-    '''
-    Generates a Mermaid.js diagram with self-verification.
-    '''
-    draft_prompt = PromptTemplate(
-        input_variables=["code"],
-        template="""You are creating a documentation for a codebase with your team. Your task is to
-                    analyze this code and draft a Mermaid diagram covering:
-1. Main components
-2. Data/control flow
-3. Key relationships
-4. Important states
-
-Return ONLY the Mermaid code.
-
-Code:
-{code}
-
-Draft Diagram:"""
-    )
-    draft_chain = LLMChain(llm=llm, prompt=draft_prompt)
-    draft_diagram = draft_chain.run(code)
-
-    review_prompt = PromptTemplate(
-        input_variables=["code", "draft_diagram"],
-        template="""You are creating a documentation for a codebase with your team. Your task is to
-                    analyze this mermaid code and verify this Mermaid diagram:
-1. Check component completeness
-2. Validate relationships
-3. Confirm flow accuracy
-4. Suggest improvements
-
-Code:
-{code}
-
-Draft Diagram:
-{draft_diagram}
-
-Diagram Review:"""
-    )
-    review_chain = LLMChain(llm=llm, prompt=review_prompt)
-    review = review_chain.run({"code": code, "draft_diagram": draft_diagram})
-
-    final_prompt = PromptTemplate(
-        input_variables=["code", "draft_diagram", "review"],
-        template="""You are creating a documentation for a codebase with your team. Your team made a mermaid code draft and a review
-                    to the draft, your job is to combine these and generate the mermaid diagram for the documentation:
-1. Review feedback
-2. Complete representation
-3. Clear relationships
-4. Optimal layout
-
-Return ONLY the Mermaid code.
-
-Code:
-{code}
-
-Draft Diagram:
-{draft_diagram}
-
-Review:
-{review}
-
-Final Diagram:"""
-    )
-    final_chain = LLMChain(llm=llm, prompt=final_prompt)
-    final_diagram = final_chain.run({"code": code, "draft_diagram": draft_diagram, "review": review})
-    
-    if final_diagram.startswith("```mermaid"):
-        final_diagram = final_diagram[10:-3].strip()
-    elif final_diagram.startswith("```"):
-        final_diagram = final_diagram[3:-3].strip()
-    
-    return final_diagram
-
-
-@tool()
-def create_markdown_documentation(summaries: list, diagrams: list, output_file: str) -> str:
+def create_markdown_documentation(summaries: list, output_file: str) -> str:
     '''
     Creates a Markdown documentation file with summaries and Mermaid diagrams.
     
     Args:
         summaries: List of dictionaries with 'file_path' and 'summary'
-        diagrams: List of Mermaid diagram codes
         output_file: Path to save the Markdown file
     '''
+    parser = JsonOutputParser()
+    PROJECT_OVERVIEW_PROMPT = (
+        "You are creating the project overview documentation for a codebase."
+        "Generate a comprehensive project overview using the following file summaries. "
+        "The overview should include:\n"
+        "1. **Project Purpose**: A clear description of what the project does and its main objectives.\n"
+        "2. **Key Components**: A breakdown of modules and their roles.\n"
+        "3. **Interaction Flow**: How components work together (e.g., data flow, control flow). Who relies on who to achieve what\n"
+        "4. **Activity Diagram**: A Mermaid.js-compatible detailed description of the entire workflow so that how the code works, who calls who and why, include every function call.\n\n"
+        "Write in natural, documentation-friendly prose—avoid phrases like 'the provided files' or 'as we can see'.\n\n"
+        "File Summaries:\n"
+        f"{summaries}\n\n"
+        "Follow this Output Structure and onlz return this and nothing else:\n"
+        "# Project Overview\n\n"
+        "## Purpose\n<2-3 sentences>\n\n"
+        "## Components\n<bullet list of major components>\n\n"
+        "## Interactions\n<brief explanation of how components connect>\n\n"
+        "```mermaid\ngraph TD\n<flow logic>\n```\n"
+        "```"
+    )
+
+    overview = llm.invoke(PROJECT_OVERVIEW_PROMPT)
+
+    SNIPPET_COLLECTION_PROMPT = PromptTemplate.from_template("""
+    You are documenting a codebase for developers who need to understand the code to contribute effectively. 
+    Your task is to analyze the code and identify *only the most significant sections* that require explanation. 
+    IMPORTANT YOUR JOB IS NOT TO TRANSLATE CODE INTO HUMAN LANGUAGE, YOUR JOB IS TO EXPLAIN NON-TRIVIAL DEVELOPER CHOICES.
+    IGNORE trivial code such as:
+    - Simple variable declarations (e.g., `x = 5`)
+    - Basic return statements (e.g., `return x`)
+    - Standard boilerplate (e.g., imports)
+    - Obvious or self-explanatory code
+
+    For each significant section:
+    1. Extract the corresponding lines of code.
+    2. Provide a concise explanation that covers:
+    - What the code does and why it matters in the context of the file/project.
+    - Any non-obvious design decisions or implementation details.
+    - How it interacts with other parts of the codebase (if relevant).
+
+    Project context: {project_summary}
+    File purpose: {file_summary}
+
+    Your output MUST be valid JSON in this exact format and contain NO extra text:
+    {{
+        "sections": [
+            {{
+                "code": "The code that is being explained",
+                "explanation": "Concise, developer-focused explanation"
+            }}
+        ]
+    }}
+
+    Code:
+    {code}
+    """)
+    
+    DOCUMENTATION_GENERATION_PROMPT = """
+    You are creating professional documentation for a codebase, guiding a new developer through the code in a clear, concise, and insightful way. 
+    Your task is to write a narrative that explains the file's key functionality, focusing only on the most significant code sections (provided in the analysis). 
+    Avoid explaining trivial details like simple variable assignments, return statements, or boilerplate code. 
+    Instead, emphasize:
+    - The purpose of the code and its role in the project.
+    - How the significant sections contribute to the file's functionality.
+    - Any complex logic, design decisions, or interactions with other parts of the codebase.
+
+    Write in a professional, tutorial-style tone, as if this is part of a larger project documentation. 
+    Do not walk through the entire code line-by-line; instead, weave the provided code snippets into a cohesive explanation of the file's purpose and key operations. 
+    Use markdown format for code blocks, but do not include titles or headers—just the narrative and code.
+
+    Project context: {project_summary}
+    File summary: {file_summary}
+    Code analysis: {analysis}
+    """
+
+    chain: Runnable = SNIPPET_COLLECTION_PROMPT | llm | parser
+    
+    analyzed_files = []
+    for file_docs in summaries:
+        try:
+            analysis = chain.invoke({
+                "project_summary": overview.content, 
+                "file_summary": file_docs['summary'], 
+                "code": file_docs['code']
+            })
+            analyzed_files.append({
+                "file_path": file_docs['file_path'],
+                "summary": file_docs['summary'],
+                "analysis": analysis,
+                "elements": file_docs.get('elements', [])
+            })
+        except Exception as e:
+            print(f"Error parsing structured output for {file_docs['file_path']}: {e}")
+            analyzed_files.append({
+                "file_path": file_docs['file_path'],
+                "summary": file_docs['summary'],
+                "analysis": {"sections": []},
+                "elements": file_docs.get('elements', [])
+            })
+
     output_dir = os.path.dirname(output_file)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
-    
+
     with open(output_file, 'w', encoding='utf-8') as md_file:
-        md_file.write("# Codebase Documentation\n\n")
+        md_file.write("# Documentation\n\n")
+        md_file.write(overview.content + "\n\n")
         
-        for file_docs in summaries:
-            md_file.write(f"## `{file_docs['file_path']}`\n\n")
-            md_file.write(f"**Summary**: {file_docs['summary']}\n\n")
+        md_file.write("# Project Components\n\n")
+        for file_data in analyzed_files:
+            md_file.write(f"## `{file_data['file_path']}`\n\n")
+            md_file.write("### File Overview\n")
+            md_file.write(f"{file_data['summary']}\n\n")
+
+            docs = llm.invoke(
+                PromptTemplate.from_template(DOCUMENTATION_GENERATION_PROMPT).format(
+                    project_summary = overview.content,
+                    file_summary=file_data['summary'],
+                    analysis=json.dumps(file_data['analysis'])
+                )
+            )
+            md_file.write(docs.content + "\n\n")
             
-            for element in file_docs['elements']:
+
+        elements_to_document = [
+            element for element in file_data['elements'] 
+            if element['type'] in ('class', 'function')
+        ]
+
+        if elements_to_document:
+            md_file.write("### Functions and Classes\n\n")
+            for element in file_data['elements']:
                 if element['type'] in ('class', 'function'):
                     md_file.write(element['docs'] + "\n\n")
-            
-            md_file.write("---\n\n")
-    
+        
     return f"Markdown documentation created at {output_file}"
 
-
 @tool()
-def process_repo(clone_dir: str, output_dir: str) -> str:
+def process_repo(repo_path: str, output_dir: str) -> str:
     '''
     Processes a repository file by file, generates documentation in Markdown format
     with embedded Mermaid diagrams.
-    '''
-    files = split_repo.invoke({"clone_dir": clone_dir})
-    summaries = []
-    diagrams = []
-    
-    os.makedirs(output_dir, exist_ok=True)
-    
-    for file in files:
-        file_path = file['file_path']
-        file_content = file['content']
-        print(f"Processing file: {file_path}")
-        
-        summary = summarize_code.invoke({"code": file_content})
-        summaries.append({"file_path": file_path, "summary": summary})
-        
-        mermaid_code = generate_mermaid_diagram.invoke({"code": file_content})
-        diagrams.append(mermaid_code if mermaid_code else "")
 
-    md_path = os.path.join(output_dir, "DOCUMENTATION.md")
-    create_markdown_documentation.invoke({
-        "summaries": summaries,
-        "diagrams": diagrams,
-        "output_file": md_path
-    })
-    
-    return f"Processed {len(files)} files. Documentation written to {output_dir}"
-
-
-@tool()
-def process_repo2(clone_dir: str, output_dir: str) -> str:
+    Args:
+        repo_path: Path to the local repository directory
+        output_dir: Directory to save the documentation
     '''
-    Processes a repository file by file, generates documentation in Markdown format
-    with embedded Mermaid diagrams.
-    '''
-    files = split_repo.invoke({"clone_dir": clone_dir})
+    files = split_repo.invoke({"repo_path": repo_path})
     all_docs = []
     
     for file in files:
@@ -524,7 +486,5 @@ def process_repo2(clone_dir: str, output_dir: str) -> str:
 
     create_markdown_documentation.invoke({
         "summaries": all_docs,
-        "diagrams": [],
-        "output_file": os.path.join(output_dir, "DOCUMENTATION.md")
+        "output_file": os.path.join(output_dir, "documentation.md")
     })
-    return f"Processed {len(all_docs)} files"
