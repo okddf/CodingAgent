@@ -18,11 +18,6 @@ PYTHON_LANGUAGE = Language(tspython.language())
 CLASS_TEMPLATE = """## `{class_name}`
 {description}
 
-**Attributes**:
-| Name | Type | Description |
-|------|------|-------------|
-{attributes_table}
-
 **Methods**:
 {methods_list}"""
 
@@ -48,34 +43,102 @@ def extract_elements_with_parser(code: str, parser) -> List[Dict]:
     Extract classes and functions using tree-sitter.
     """
     elements = []
+    method_names = []
     tree = parser.parse(bytes(code, "utf8"))
 
     query = PYTHON_LANGUAGE.query("""
     (function_definition
       (identifier)@name
-        (parameters)@parameters
+      (parameters)@parameters
       (block)@block
     ) @function
+    
+    (class_definition
+      (identifier)@classname
+      (block
+        (function_definition)@method
+      )@classblock
+    ) @class
     """)
+
+
     captures = query.captures(tree.root_node)
+
+    try:
+        captures["class"]
+        classes = True
+    except:
+        classes = False
+
+    try:
+        captures["function"]
+        functions = True
+    except:
+        functions = False
+
     if len(captures) > 0:
-        for i in range(len(captures["function"])):
-            for child in captures["function"][i].children:
-                if child.type == 'identifier':
-                    function_name = child.text.decode('utf8') 
-                if child.type == 'parameters':
-                    parameters = child.text.decode('utf8') 
-                if child.type == 'block':
-                    block = child.text.decode('utf8') 
+        if classes:
+            for i in range(len(captures["class"])):
+                for child in captures["class"][i].children:
+                    if child.type == 'identifier':
+                        class_name = child.text.decode('utf8') 
+                    if child.type == 'block':
+                        class_block = child.text.decode('utf8') 
 
-            elements.append({
-                "type": "function",
-                "name": function_name,
-                "code": block
-            })
+                        method_query = PYTHON_LANGUAGE.query("""
+                        (function_definition
+                        name: (identifier) @methodname
+                        parameters: (parameters) @methodparams
+                        body: (block) @methodbody
+                        ) @method
+                        """)
+                    
+                        method_captures = method_query.captures(child)
+                        methods = []
+
+                        for i in range(len(method_captures["method"])):
+                            for classchild in method_captures["method"][i].children:
+                                if classchild.type == 'identifier':
+                                    method_name = classchild.text.decode('utf8') 
+                                    method_names.append(method_name)
+                                if classchild.type == 'parameters':
+                                    method_parameters = classchild.text.decode('utf8') 
+                                if classchild.type == 'block':
+                                    method_block = classchild.text.decode('utf8')
+                        
+                        methods.append({
+                            "name": method_name,
+                            "parameters": method_parameters,
+                            "code": method_block
+                        })
+
+                elements.append({
+                    "type": "class",
+                    "name": class_name,
+                    "methods": methods,
+                    "code": class_block
+                })
+
+        if functions:
+            for i in range(len(captures["function"])):
+                for child in captures["function"][i].children:
+                    if child.type == 'identifier':
+                        function_name = child.text.decode('utf8') 
+                    if child.type == 'parameters':
+                        parameters = child.text.decode('utf8') 
+                    if child.type == 'block':
+                        block = child.text.decode('utf8') 
+
+                if function_name in method_names:
+                    continue
+
+                elements.append({
+                    "type": "function",
+                    "name": function_name,
+                    "parameters": parameters,
+                    "code": block
+                })
         
-    print(elements)
-
     return elements
 
 @tool()
@@ -96,20 +159,29 @@ def identify_excludable_files(file_paths: list) -> list:
     excluded_files = []
         
     for file_path in file_paths:
+        normalized_path = file_path.replace(os.sep, '/')
         basename = os.path.basename(file_path)
         if basename.startswith('.'):
             excluded_files.append(file_path)
             continue
             
+        excluded = False
         for pattern in EXCLUDE_PATTERNS:
-            if pattern.endswith('*') and not pattern.startswith('*'):
-                dir_pattern = pattern.rstrip('*')
-                if dir_pattern in file_path.split(os.sep):
-                    excluded_files.append(file_path)
+            if pattern.endswith('/'):
+                dir_pattern = pattern.rstrip('/')
+                if dir_pattern in normalized_path.split('/'):
+                    excluded = True
                     break
-            elif fnmatch.fnmatch(file_path, pattern) or fnmatch.fnmatch(basename, pattern):
-                excluded_files.append(file_path)
+            elif '*' in pattern:
+                if fnmatch.fnmatch(basename, pattern) or fnmatch.fnmatch(normalized_path, pattern):
+                    excluded = True
+                    break
+            elif pattern == basename or pattern in normalized_path.split('/'):
+                excluded = True
                 break
+        
+        if excluded:
+            excluded_files.append(file_path)
     
     print(excluded_files)
     return excluded_files
@@ -203,82 +275,113 @@ def parse_elements_from_text(text: str) -> List[Dict]:
     
     return elements
 
-def generate_structured_docs(element_type: str, code: str, file_extension: str) -> str:
+def generate_structured_docs(element: dict, file_extension: str) -> str:
     parser = JsonOutputParser()
     prompt = None
-    if element_type == "class":
+    if element["type"] == "class":
         prompt = PromptTemplate.from_template("""
-        You are an AI tool that extracts structured documentation from {file_extension} class code:
+        Create a strucutured class api documentation from this {file_extension} class:
+        Extract the following information:
         1. Class name
-        2. All attributes with types
-        3. All methods with signatures
+        2. A small description of the functionality of this class
+        3. All methods with the following:
+            1. Function name
+            2. A small description of the functionality of this function
+            3. All parameters with types and default value if they are available
+            4. Return type and a small description of this piece of data if available
 
         Class code:
         {code}
+                                              
+        Class name:
+        {name}
+                                              
+        Class methods:
+        {methods}
 
         Your output MUST be valid JSON in this exact format and contain NO explanation, commentary, or extra text
-        Return ONLY the JSON code and nothing else like this:
+        If there are no parameters you can return an empty list there, same with returns with empty dictionary.
+        Return ONLY the raw JSON code and nothing else in strictly this format:
         {{
-            "class_name": "ClassName",
-            "description": "Class purpose",
-            "attributes": [
-                {{"name": "attr1", "type": "str", "description": "..."}}
-            ],
+            "class_name": "...",
+            "description": "...",
             "methods": [
-                {{"name": "method1", "params": ["param1: type"], "description": "..."}}
+                {{"name": "method1", "params": [{{"name": "param1", "type": "str", "default": "None", "description": "..."}}], "returns": {{"type": "return_type", "description": "..."}}}}
             ]
         }}""")
-    elif element_type == "function":
+
+        chain: Runnable = prompt | llm | parser
+        try:
+            data = chain.invoke({"code": element["code"], "name": element["name"], "methods": element["methods"], "file_extension": file_extension})
+        except Exception as e:
+            print(f"Error parsing structured output: {e}")
+            return f"**Error generating docs for this {element["type"]}**"
+
+        methods_list = []
+        for method in data["methods"]:
+            params_table = "\n".join(
+                f"| `{param['name']}` | `{param.get('type', '')}` | `{param.get('default', '')}` | {param['description']} |"
+                for param in method.get("params", [])
+            )
+
+            returns_table = f"| `{method['returns'].get('type', 'void')}` | {method['returns'].get('description', '')} |"
+
+            formatted_method = FUNCTION_TEMPLATE.format(
+                language=file_extension,
+                function_name=method.get("name", "unknown_function"),
+                description=method.get("description", ""),
+                params=", ".join(p.get('name', '') for p in method.get("params", [])),
+                return_type=method['returns'].get('type', 'void'),
+                params_table=params_table,
+                returns_table=returns_table
+            )
+
+            methods_list.append(formatted_method)
+
+        return CLASS_TEMPLATE.format(
+            language=file_extension,
+            class_name=data.get("class_name", "UnknownClass"),
+            description=data.get("description", ""),
+            methods_list=methods_list
+        )
+    
+    elif element["type"] == "function":
         prompt = PromptTemplate.from_template("""
-        You are an AI tool that extracts structured documentation from {file_extension} function code::
+        Create a strucutured function api documentation from this {file_extension} function:
+        Extract the following information:
         1. Function name
-        2. All parameters with types
-        3. Return type
+        2. A small description of the functionality of this function
+        3. All parameters with types and default value if available
+        4. Return type and a small description of this piece of data
 
         Function code:
         {code}
-
+        
+        Function name:
+        {name}
+                                              
+        function parameters:
+        {parameters}
+                                              
         Your output MUST be valid JSON in this exact format and contain NO explanation, commentary, or extra text
+        If there are no parameters you can return an empty list there, same with returns.
         Return ONLY the raw JSON code and nothing else in strictly this format:
         {{
-            "function_name": "function_name",
-            "description": "Function purpose",
+            "function_name": "...",
+            "description": "...",
             "params": [
                 {{"name": "param1", "type": "str", "default": "None", "description": "..."}}
             ],
             "returns": {{"type": "return_type", "description": "..."}}
         }}""")
 
-    if prompt is not None:
         chain: Runnable = prompt | llm | parser
-    else :
-        return ""
-    try:
-        data = chain.invoke({"code": code, "file_extension": file_extension})
-    except Exception as e:
-        print(f"Error parsing structured output: {e}")
-        return f"**Error generating docs for this {element_type}**"
-
-    if element_type == "class":
-        attrs_table = "\n".join(
-            f"| `{attr['name']}` | `{attr.get('type', '')}` | {attr['description']} |"
-            for attr in data.get("attributes", [])
-        )
-
-        methods_list = "\n".join(
-            f"- `{method['name']}({', '.join(method['params'])})`: {method['description']}"
-            for method in data.get("methods", [])
-        )
+        try:
+            data = chain.invoke({"code": element["code"], "name": element["name"], "parameters": element["parameters"], "file_extension": file_extension})
+        except Exception as e:
+            print(f"Error parsing structured output: {e}")
+            return f"**Error generating docs for this {element["type"]}**"
         
-        return CLASS_TEMPLATE.format(
-            language="C++",
-            class_name=data.get("class_name", "UnknownClass"),
-            description=data.get("description", ""),
-            attributes_table=attrs_table,
-            methods_list=methods_list
-        )
-        
-    else:
         params_table = "\n".join(
             f"| `{param['name']}` | `{param.get('type', '')}` | `{param.get('default', '')}` | {param['description']} |"
             for param in data.get("params", [])
@@ -287,7 +390,7 @@ def generate_structured_docs(element_type: str, code: str, file_extension: str) 
         returns_table = f"| `{data['returns'].get('type', 'void')}` | {data['returns'].get('description', '')} |"
         
         return FUNCTION_TEMPLATE.format(
-            language="C++",
+            language=file_extension,
             function_name=data.get("function_name", "unknown_function"),
             description=data.get("description", ""),
             params=", ".join(p.get('name', '') for p in data.get("params", [])),
@@ -306,7 +409,6 @@ def process_file(file_path: str, code: str) -> Dict:
     if file_extension == '.py':
         parser = initialize_parser()
         elements = extract_elements_with_parser(code, parser)
-        #elements = extract_elements_with_llm(code, file_extension)
     else:
         elements = extract_elements_with_llm(code, file_extension)
 
@@ -322,7 +424,7 @@ def process_file(file_path: str, code: str) -> Dict:
     
     processed_elements = []
     for element in elements:
-        docs = generate_structured_docs(element["type"], element["code"], file_extension)
+        docs = generate_structured_docs(element, file_extension)
         processed_elements.append({
             **element,
             "docs": docs
@@ -472,6 +574,8 @@ def create_markdown_documentation(summaries: list, output_file: str) -> str:
             element for element in file_data['elements'] 
             if element['type'] in ('class', 'function')
         ]
+
+        print(elements_to_document)
 
         if elements_to_document:
             md_file.write("### Functions and Classes\n\n")

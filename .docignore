@@ -22,3 +22,4 @@
 .env.*
 .git
 .*
+__init__.py
