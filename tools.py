@@ -336,13 +336,14 @@ def generate_structured_docs(element: dict, file_extension: str) -> str:
                 returns_table=returns_table
             )
 
-            methods_list.append(formatted_method)
+            methods_list.append(f"\n{formatted_method}\n")
 
+        methods_section = "\n---\n".join(methods_list)
         return CLASS_TEMPLATE.format(
             language=file_extension,
             class_name=data.get("class_name", "UnknownClass"),
             description=data.get("description", ""),
-            methods_list=methods_list
+            methods_list=methods_section
         )
     
     elif element["type"] == "function":
@@ -569,19 +570,16 @@ def create_markdown_documentation(summaries: list, output_file: str) -> str:
             )
             md_file.write(docs.content + "\n\n")
             
+            elements_to_document = [
+                element for element in file_data['elements'] 
+                if element['type'] in ('class', 'function')
+            ]
 
-        elements_to_document = [
-            element for element in file_data['elements'] 
-            if element['type'] in ('class', 'function')
-        ]
-
-        print(elements_to_document)
-
-        if elements_to_document:
-            md_file.write("### Functions and Classes\n\n")
-            for element in file_data['elements']:
-                if element['type'] in ('class', 'function'):
-                    md_file.write(element['docs'] + "\n\n")
+            if elements_to_document:
+                md_file.write("### Functions and Classes\n\n")
+                for element in file_data['elements']:
+                    if element['type'] in ('class', 'function'):
+                        md_file.write(element['docs'] + "\n\n")
         
     return f"Markdown documentation created at {output_file}"
 
