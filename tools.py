@@ -1,7 +1,5 @@
 from langchain.tools import tool
-from langchain_community.document_loaders import DirectoryLoader
 import os
-import ast
 from langchain.prompts import PromptTemplate
 from llm import llm
 import fnmatch
@@ -10,10 +8,17 @@ from langchain_core.output_parsers.json import JsonOutputParser
 from langchain.prompts import PromptTemplate
 from langchain.schema.runnable import Runnable
 import json
-from tree_sitter import Language, Parser
-import tree_sitter_python as tspython
+from parser import extract_elements_with_parser, extract_elements_with_llm
+from langchain_community.vectorstores import FAISS
+from langchain_openai import OpenAIEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
 
-PYTHON_LANGUAGE = Language(tspython.language())
+TEXT_SPLITTER = RecursiveCharacterTextSplitter(
+    chunk_size=100,
+    chunk_overlap=50,
+    separators=["\nclass ", "\ndef ", "\n\n", "\n"]
+)
 
 CLASS_TEMPLATE = """## `{class_name}`
 {description}
@@ -34,112 +39,65 @@ FUNCTION_TEMPLATE = """## `{function_name}({params}) -> {return_type}`
 |------|-------------|
 {returns_table}"""
 
-def initialize_parser():
-    parser = Parser(PYTHON_LANGUAGE)
-    return parser
-
-def extract_elements_with_parser(code: str, parser) -> List[Dict]:
-    """
-    Extract classes and functions using tree-sitter.
-    """
-    elements = []
-    method_names = []
-    tree = parser.parse(bytes(code, "utf8"))
-
-    query = PYTHON_LANGUAGE.query("""
-    (function_definition
-      (identifier)@name
-      (parameters)@parameters
-      (block)@block
-    ) @function
+def create_vector_store(files):
+    """Create during repo processing"""
+    documents = []
     
-    (class_definition
-      (identifier)@classname
-      (block
-        (function_definition)@method
-      )@classblock
-    ) @class
-    """)
+    for file in files:
+        chunks = TEXT_SPLITTER.split_text(file['content'])
+        for chunk in chunks:
+            documents.append(Document(
+                page_content=chunk,
+                metadata={"file_path": file['file_path']}
+            ))
+    
+    return FAISS.from_documents(documents, OpenAIEmbeddings())
 
+def scan(repo_path: str):
+    """First pass: Collect raw file contents and basic structure"""
+    files = split_repo.invoke({"repo_path": repo_path})
+    vector_store = create_vector_store(files)
+    
+    PROMPT = PromptTemplate.from_template(
+        "In 10 words or a sentence, what does the file contain, calsses or functions that do what?\n"
+        "Code:\n{code}\n\n"
+    )
 
-    captures = query.captures(tree.root_node)
+    preliminary_docs = []
+    for file in files:
+        preliminary_docs.append({
+            "file_path": file['file_path'],
+            "content": file['content'],
+            "scan": llm.invoke(PROMPT.format(code=file['content'])).content
+        })
+    
+    return preliminary_docs, vector_store
 
-    try:
-        captures["class"]
-        classes = True
-    except:
-        classes = False
+def generate_context(files):
+    """Create project overview before deep file analysis"""
+    project_summary = llm.invoke(
+        "Based on these small sumamries, describe the project's purpose"
+        "and main components in 3-4 sentences:\n\n" +
+        "\n".join(f"{file['file_path']}: {file['scan']}" 
+                 for file in files)
+    ).content
+    
+    return project_summary,
 
-    try:
-        captures["function"]
-        functions = True
-    except:
-        functions = False
-
-    if len(captures) > 0:
-        if classes:
-            for i in range(len(captures["class"])):
-                for child in captures["class"][i].children:
-                    if child.type == 'identifier':
-                        class_name = child.text.decode('utf8') 
-                    if child.type == 'block':
-                        class_block = child.text.decode('utf8') 
-
-                        method_query = PYTHON_LANGUAGE.query("""
-                        (function_definition
-                        name: (identifier) @methodname
-                        parameters: (parameters) @methodparams
-                        body: (block) @methodbody
-                        ) @method
-                        """)
-                    
-                        method_captures = method_query.captures(child)
-                        methods = []
-
-                        for i in range(len(method_captures["method"])):
-                            for classchild in method_captures["method"][i].children:
-                                if classchild.type == 'identifier':
-                                    method_name = classchild.text.decode('utf8') 
-                                    method_names.append(method_name)
-                                if classchild.type == 'parameters':
-                                    method_parameters = classchild.text.decode('utf8') 
-                                if classchild.type == 'block':
-                                    method_block = classchild.text.decode('utf8')
-                        
-                        methods.append({
-                            "name": method_name,
-                            "parameters": method_parameters,
-                            "code": method_block
-                        })
-
-                elements.append({
-                    "type": "class",
-                    "name": class_name,
-                    "methods": methods,
-                    "code": class_block
-                })
-
-        if functions:
-            for i in range(len(captures["function"])):
-                for child in captures["function"][i].children:
-                    if child.type == 'identifier':
-                        function_name = child.text.decode('utf8') 
-                    if child.type == 'parameters':
-                        parameters = child.text.decode('utf8') 
-                    if child.type == 'block':
-                        block = child.text.decode('utf8') 
-
-                if function_name in method_names:
-                    continue
-
-                elements.append({
-                    "type": "function",
-                    "name": function_name,
-                    "parameters": parameters,
-                    "code": block
-                })
-        
-    return elements
+def get_relevant_context(vector_store, code: str, current_file_path: str, k: int = 3) -> str:
+    """Retrieve relevant code snippets from other files"""
+    results = vector_store.similarity_search(code, k=k)
+    context = []
+    
+    for doc in results:
+        if doc.metadata['file_path'] != current_file_path:
+            context.append(
+                f"From {doc.metadata['file_path']}:\n"
+                f"{doc.page_content}\n"
+                f"{'-'*40}"
+            )
+    
+    return "\n".join(context) if context else "No relevant context found"
 
 @tool()
 def identify_excludable_files(file_paths: list) -> list:
@@ -223,57 +181,6 @@ def split_repo(repo_path: str) -> list:
             print(f"Skipping {file_path} due to error: {e}")
     
     return filtered_files
-
-def extract_elements_with_llm(code: str, file_extension: str) -> List[Dict]:
-    """
-    Extract code elements using text-based format
-    """
-    prompt = f"""You are documenting a {file_extension} codebase. Extract ONLY class/function definitions THAT ARE DEFINED IN THIS FILE.
-    If there is no such definition simply return a message saying you didn't find any.
-
-    IGNORE:
-    - Imported classes/functions (e.g., `from x import Y`)
-    - Instantiations (`x = ClassName()`)
-    - Function calls (`function_name()`)
-    - Decorators (unless part of the definition)
-    - Comments/docstrings (keep them only if they're inside the definition)
-
-    OUTPUT FORMAT:
-    === ELEMENT ===
-    Type: class or function depending on the element type
-    Name: the name of the defined element
-    Code: full code of the element
-    === END ELEMENT ===
-
-    CODE TO ANALYZE:
-    {code}"""
-    
-    response = llm.invoke(prompt).content
-    return parse_elements_from_text(response)
-
-def parse_elements_from_text(text: str) -> List[Dict]:
-    """Parse the text response into structured elements"""
-    elements = []
-    current_element = {}
-    
-    for line in text.split('\n'):
-        line = line.strip()
-        if line.startswith("=== ELEMENT ==="):
-            current_element = {}
-        elif line.startswith("Type:"):
-            current_element["type"] = line.split(":", 1)[1].strip()
-        elif line.startswith("Name:"):
-            current_element["name"] = line.split(":", 1)[1].strip()
-        elif line.startswith("Code:"):
-            current_element["code"] = ""
-        elif line.startswith("=== END ELEMENT ==="):
-            if current_element:
-                current_element["code"] = current_element["code"].strip()
-                elements.append(current_element)
-        elif "code" in current_element:
-            current_element["code"] += line + "\n"
-    
-    return elements
 
 def generate_structured_docs(element: dict, file_extension: str) -> str:
     parser = JsonOutputParser()
@@ -400,28 +307,33 @@ def generate_structured_docs(element: dict, file_extension: str) -> str:
             returns_table=returns_table
         )
 
-def process_file(file_path: str, code: str) -> Dict:
+def process_file(file_path: str, code: str, vector_store, project_context) -> Dict:
     """
     Create structured documentation for a file.
     """
     print(f"Analyzing {file_path}")
     file_extension = os.path.splitext(file_path)[1]
 
+    rag_context = ""
+    if vector_store:
+        rag_context = get_relevant_context(vector_store, code, file_path)
+        print(f"Found relevant context for {file_path}:\n{rag_context[:200]}...")
+
     if file_extension == '.py':
-        parser = initialize_parser()
-        elements = extract_elements_with_parser(code, parser)
+        elements = extract_elements_with_parser(code)
     else:
         elements = extract_elements_with_llm(code, file_extension)
 
-    PROMPT = (
-        "You are documenting a codebase. Analyze the given code and summarize its purpose and content. "
-        "The summary should be concise yet informative, explaining what the code does without technical jargon. "
-        "Write it as if it's part of natural developer documentation—avoid phrases like 'the provided code' or 'this file contains'. "
-        "Make it seem like that this is part of a big documentation and this is not an alone code snippet"
-        f"Here is the code to analyze: {code}"
+    PROMPT = PromptTemplate.from_template(
+        "Describe this file's role in the project and summarize the content of it in 1 sentence.\n"
+        "Focus only on the core functionality and the place of this file in the project\n"
+        "Avoid introductory phrases and implementation details.\n\n"
+        "Code:\n{code}\n\n"
+        "Related context: {context}\n"
+        "Project context: {project_context}"
     )
 
-    file_summary = llm.invoke(PROMPT)
+    file_summary = llm.invoke(PROMPT.format(code=code, context=rag_context, project_context = project_context))
     
     processed_elements = []
     for element in elements:
@@ -517,6 +429,8 @@ def create_markdown_documentation(summaries: list, output_file: str) -> str:
     Do not walk through the entire code line-by-line; instead, weave the provided code snippets into a cohesive explanation of the file's purpose and key operations. 
     Use markdown format for code blocks, but do not include titles or headers—just the narrative and code.
 
+    Keep it simple and short, only write a few words to each concept or section
+
     Project context: {project_summary}
     File summary: {file_summary}
     Code analysis: {analysis}
@@ -593,11 +507,14 @@ def process_repo(repo_path: str, output_dir: str) -> str:
         repo_path: Path to the local repository directory
         output_dir: Directory to save the documentation
     '''
-    files = split_repo.invoke({"repo_path": repo_path})
+
+    files, vector_store = scan(repo_path=repo_path)
+    project_context = generate_context(files)
+
     all_docs = []
     
     for file in files:
-        processed = process_file(file['file_path'], file['content'])
+        processed = process_file(file['file_path'], file['content'], vector_store, project_context)
         all_docs.append(processed)
 
     create_markdown_documentation.invoke({
