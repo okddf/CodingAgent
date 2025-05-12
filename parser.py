@@ -106,7 +106,9 @@ def extract_elements_with_parser(code: str) -> List[Dict]:
                     "parameters": parameters,
                     "code": block
                 })
-        
+    
+    for element in elements:
+        print(element["code"])
     return elements
 
 
