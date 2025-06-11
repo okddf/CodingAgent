@@ -61,19 +61,20 @@ def scan(repo_path: str):
     vector_store = create_vector_store(files)
     
     PROMPT = PromptTemplate.from_template(
-        "In 10 words or a sentence, what does the file contain, calsses or functions that do what?\n"
+        "In 10 words or a sentence, what does the file contain,"
+        "calsses or functions that do what?\n"
         "Code:\n{code}\n\n"
     )
 
-    preliminary_docs = []
+    docs = []
     for file in files:
-        preliminary_docs.append({
+        docs.append({
             "file_path": file['file_path'],
             "content": file['content'],
             "scan": llm.invoke(PROMPT.format(code=file['content'])).content
         })
     
-    return preliminary_docs, vector_store
+    return docs, vector_store
 
 def call_analyzer(file_path: str) -> Dict[str, List[str]]:
     """
@@ -405,10 +406,6 @@ def process_file(file_path: str, code: str, vector_store, project_context) -> Di
         elements = extract_elements_with_parser(code)
     else:
         elements = extract_elements_with_llm(code, file_extension)
-    
-    for element in elements:
-        element_complexity = calculate_complexity(element["code"])
-        element["complexity"] = element_complexity
 
     PROMPT = PromptTemplate.from_template(
         "Describe this file's role in the project and summarize the content of it in 1 sentence.\n"
@@ -449,7 +446,6 @@ def create_markdown_documentation(docs: list, output_file: str) -> str:
         summaries: List of dictionaries with documents
         output_file: Path to save the Markdown file
     '''
-
     file_paths = []
     summaries = []
     elements = []
@@ -543,9 +539,6 @@ def create_markdown_documentation(docs: list, output_file: str) -> str:
 
     core = llm.invoke(CORE_PROMPT.format(overview = overview, file_paths=file_paths, summaries=summaries, elements = elements, callmaps = callmaps))
     sequence = llm.invoke(SEQUENCE_PROMPT.format(core=core, file_paths=file_paths, summaries=summaries, elements = elements, callmaps = callmaps))
-
-
-
 
     SNIPPET_COLLECTION_PROMPT = PromptTemplate.from_template("""
         You are documenting a codebase for developers. Only document code that meets ALL these criteria:
@@ -690,7 +683,7 @@ def process_repo(repo_path: str, output_dir: str) -> str:
     docs = []
     
     for file in files:
-        processed = process_file(file['file_path'], file['content'], vector_store, project_context)
+        processed = process_file(repo_path + "\\" + file['file_path'], file['content'], vector_store, project_context)
         docs.append(processed)
 
     create_markdown_documentation.invoke({
